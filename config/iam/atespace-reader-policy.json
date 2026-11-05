@@ -1,0 +1,14 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyTheSessionAtespacesInjectableSecrets",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:us-west-2:111122223333:secret:ate/${aws:PrincipalTag/ate-atespace}/*",
+      "Condition": {
+        "StringEquals": {"aws:ResourceTag/ate.dev/injectable": "true"}
+      }
+    }
+  ]
+}

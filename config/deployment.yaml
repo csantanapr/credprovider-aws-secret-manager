@@ -1,0 +1,132 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aws-sm-credential-provider
+  namespace: ate-system
+  labels:
+    app: aws-sm-credential-provider
+spec:
+  # Two replicas: a restart or a node drain must not fail every injection.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aws-sm-credential-provider
+  template:
+    metadata:
+      labels:
+        app: aws-sm-credential-provider
+    spec:
+      serviceAccountName: aws-sm-credential-provider
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: aws-sm-credential-provider
+      containers:
+      - name: aws-sm-credential-provider
+        image: ko://plugins.go.ate.dev/credprovider-aws-secret-manager/cmd/aws-sm-credential-provider
+        args:
+        - "--listen-address=:50051"
+        - "--health-address=:9090"
+        # A servicedns certificate for aws-sm-credential-provider.ate-system.svc,
+        # the name the egress gateway pins when it dials the provider.
+        - "--server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+        # Admit only the egress gateway (atenet-egress in ate-system). Change
+        # the namespace if substrate runs elsewhere.
+        - "--client-ca-file=/run/podidentity.podcert.ate.dev/trust-bundle.pem"
+        - "--injector-identity=spiffe://cluster.local/ns/ate-system/sa/atenet-egress"
+        # Enforce the atespace→secrets authorization policy (default-deny).
+        - "--secret-policy-file=/etc/aws-sm-credential-provider/secret-policy.yaml"
+        # The cluster's Region, for STS. The provider refuses to start until
+        # this is a real Region name.
+        - "--region=REPLACE_WITH_AWS_REGION"
+        # Under the egress gateway's 4s budget for all of a request's injections.
+        - "--fetch-timeout=2s"
+        # After a rotation the old value is injected for up to this long.
+        - "--cache-ttl=30s"
+        - "--log-level=info"
+        # Optional: IAM also enforces atespace isolation, and CloudTrail names
+        # the atespace (README, Per-atespace IAM).
+        # - "--atespace-role-arn=arn:aws:iam::111122223333:role/ate-secrets-reader"
+        ports:
+        - name: grpc
+          containerPort: 50051
+        - name: health
+          containerPort: 9090
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          periodSeconds: 20
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: secret-policy
+          mountPath: /etc/aws-sm-credential-provider
+          readOnly: true
+        - name: servicedns
+          mountPath: /run/servicedns.podcert.ate.dev
+          readOnly: true
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+          readOnly: true
+      volumes:
+      # Created by secret-policy.yaml, which the kustomization omits so a
+      # redeploy never overwrites an edited policy.
+      - name: secret-policy
+        configMap:
+          name: aws-sm-credential-provider-secret-policy
+      # The serving certificate, issued for the Services that select this pod.
+      - name: servicedns
+        projected:
+          sources:
+          - podCertificate:
+              signerName: servicedns.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+      # The CA the egress gateway's client certificate chains to.
+      - name: podidentity
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: podidentity.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem

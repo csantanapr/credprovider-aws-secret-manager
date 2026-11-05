@@ -1,0 +1,14 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OnlyTheProviderWithAnAtespaceTag",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::111122223333:role/aws-sm-credential-provider"},
+      "Action": ["sts:AssumeRole", "sts:TagSession"],
+      "Condition": {
+        "StringLike": {"aws:RequestTag/ate-atespace": "?*"}
+      }
+    }
+  ]
+}
