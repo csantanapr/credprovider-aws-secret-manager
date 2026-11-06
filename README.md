@@ -95,7 +95,7 @@ and every other code with a 403:
 | The secret is scheduled for deletion (`InvalidRequestException`), or with a key, the value is not a JSON object or the key's value is not a string | `FailedPrecondition` |
 | Secrets Manager rejects a parameter | `InvalidArgument` |
 | Secrets Manager does not answer in time | `DeadlineExceeded` |
-| Throttling, an outage, or no credentials from the Pod Identity agent | `Unavailable` |
+| Throttling, an outage, no credentials from the Pod Identity agent, or a read-concurrency limit | `Unavailable` |
 
 Error messages and logs name the secret, the key and the AWS error code, but
 never contain the value.
@@ -113,14 +113,20 @@ per replica:
 - `NotFound`, `PermissionDenied` and similar answers are kept for
   `--negative-cache-ttl`, 5s, so a misconfigured policy cannot use up the
   quota. Throttling and outages are never cached: the next request reads again.
-- Concurrent reads of one secret share one call.
+- Concurrent reads of one secret share one call. Distinct reads are bounded
+  globally and per atespace; reaching either limit returns `Unavailable` so
+  the gateway emits a retryable 503.
+- Cache payloads are bounded by both `--cache-max-entries` and
+  `--cache-max-bytes`; a single value larger than the byte budget is returned
+  but not cached.
 - Authorization runs on every request, before the cache: a value one atespace
   read is never served to another atespace without the grant.
 
 **Rotation lag.** After `AWSCURRENT` moves to a new version, each replica can
 inject the old value for up to `--cache-ttl`. Use a rotation strategy that
 keeps the previous credential valid for longer than that, such as alternating
-users, or lower the TTL. `--cache-ttl=0` turns caching off.
+users, or lower the TTL. `--cache-ttl=0` disables stage-value caching;
+version and negative entries use their own TTL flags.
 
 With 100 hot secrets on 2 replicas and a 30s TTL, the provider makes about
 576,000 calls a day, whatever the request rate.
@@ -167,11 +173,15 @@ Prerequisites:
   registry the nodes can pull from, such as Amazon ECR.
 
 **1. Create the provider's IAM role and Pod Identity association.** The role
-trusts EKS Pod Identity for this cluster only
+trusts EKS Pod Identity only for the named cluster, the `ate-system` namespace,
+and the `aws-sm-credential-provider` ServiceAccount
 ([`config/iam/pod-identity-trust-policy.json`](config/iam/pod-identity-trust-policy.json))
 and may read injectable secrets under `ate/`
 ([`config/iam/provider-role-policy.json`](config/iam/provider-role-policy.json)).
-Replace the account, Region and cluster name in both, then:
+Replace every `REPLACE_WITH_...` value in the IAM templates: account,
+Region, cluster name, KMS key ID, ARN partition (`aws`, `aws-us-gov`,
+`aws-cn`, ...), and DNS suffix (`amazonaws.com` or the partition's suffix).
+Then:
 
 ```bash
 aws iam create-role --role-name aws-sm-credential-provider \
@@ -180,7 +190,7 @@ aws iam put-role-policy --role-name aws-sm-credential-provider --policy-name rea
   --policy-document file://config/iam/provider-role-policy.json
 aws eks create-pod-identity-association --cluster-name <cluster> \
   --namespace ate-system --service-account aws-sm-credential-provider \
-  --role-arn arn:aws:iam::<account>:role/aws-sm-credential-provider
+  --role-arn arn:<partition>:iam::<account>:role/aws-sm-credential-provider
 ```
 
 For secrets encrypted with a customer managed KMS key, also add
@@ -189,9 +199,17 @@ and allow the role in the key policy. Secrets under the AWS managed key
 `aws/secretsmanager` need no KMS permission.
 
 The association must exist before the provider's pods are created: EKS adds
-the Pod Identity credentials to a pod only when the pod is created. A pod that
-started without them exits at startup with `no EKS Pod Identity credentials`;
-restart the Deployment once the association exists.
+the Pod Identity endpoint and token projection only when a pod is created. A
+pod that started without them exits at startup; restart the Deployment once
+the association exists. In required mode the provider constructs the Pod
+Identity credential provider directly. Both its local credential request and
+all STS and Secrets Manager requests use proxy-free, no-redirect HTTP clients.
+Required mode ignores default shared files and refuses conflicting static,
+web-identity, profile, relative-container, custom-CA, or configured-endpoint
+settings. The one CA bundle it accepts is the image's own system bundle,
+which the distroless base sets in `SSL_CERT_FILE`. EKS Pod Identity sets
+`AWS_REGION` and `AWS_DEFAULT_REGION` on the pod; the required `--region`
+flag overrides them, so they cannot select the STS Region.
 
 **2. Store a secret.** Name it under `ate/<atespace>/` and tag it injectable.
 Pass the value from a file, not on the command line, where other users can read
@@ -240,9 +258,9 @@ reads the policy once, at startup; after editing it, restart the provider:
 kubectl -n ate-system rollout restart deployment/aws-sm-credential-provider
 ```
 
-**4. Deploy the provider.** Set `--region` in
-[`config/deployment.yaml`](config/deployment.yaml) to the cluster's Region,
-then from this repository:
+**4. Deploy the provider.** Set `--region` and replace the partition and
+account in `--expected-role-arn` in
+[`config/deployment.yaml`](config/deployment.yaml), then from this repository:
 
 ```bash
 KO_DOCKER_REPO=<registry> make deploy
@@ -296,8 +314,11 @@ NetworkPolicy and PodDisruptionBudget, and leaves the secret policy in place.
   sets no egress policy on `ate-system`; if you add one, allow these. Interface
   VPC endpoints for `secretsmanager` and `sts` keep the traffic off the
   internet.
-- **No IMDS.** The provider never uses the node's instance role. EKS nodes
-  with IMDSv2 and a hop limit of 1 block it anyway.
+- **No IMDS in the deployment.** With the default
+  `--require-pod-identity=true`, the provider uses only the EKS Pod Identity
+  endpoint and never enters the SDK's IMDS credential chain. The explicit
+  development override `--require-pod-identity=false` restores the SDK's
+  default chain. EKS nodes should still enforce IMDSv2 with a hop limit of 1.
 
 ## Per-atespace IAM
 
@@ -312,13 +333,47 @@ CloudTrail then shows the atespace of every read.
 |---|---|
 | [`config/iam/provider-role-assume-reader-policy.json`](config/iam/provider-role-assume-reader-policy.json) | The provider's role: may assume and tag the reader role |
 | [`config/iam/atespace-reader-trust-policy.json`](config/iam/atespace-reader-trust-policy.json) | The reader role's trust policy: only the provider's role, only with an `ate-atespace` tag |
-| [`config/iam/atespace-reader-policy.json`](config/iam/atespace-reader-policy.json) | The reader role's permissions |
+| [`config/iam/atespace-reader-policy.json`](config/iam/atespace-reader-policy.json) | The reader role's Secrets Manager permissions |
+| [`config/iam/atespace-reader-kms-policy.json`](config/iam/atespace-reader-kms-policy.json) | The reader role's KMS permission for a customer managed key; also allow the reader role in the key policy |
+
+These are alternative permission sets. In per-atespace mode, do **not** attach
+`provider-role-policy.json` or `provider-role-kms-policy.json` to the base
+provider role. The base role gets only
+`provider-role-assume-reader-policy.json`; the reader role gets the two reader
+policies. This prevents a base-role client from bypassing per-atespace IAM.
 
 In this mode, cache entries are kept per atespace, so IAM decides each
 atespace's first read itself. Chained role sessions last at most one hour; the
-provider renews them. This layer guards against a mistake in the secret
-policy, not against a compromised provider, which holds the role that may
-assume any atespace's tag.
+provider starts refreshing them up to five minutes before expiration and
+bounds the complete `AssumeRole` operation, including retries, to five seconds.
+This layer guards against a mistake in the secret policy, not against a
+compromised provider, which holds the role that may assume any atespace's tag.
+
+## Cross-account secrets
+
+A remote secret needs permission on both sides. Cross-account access requires
+a customer managed KMS key because the AWS managed `aws/secretsmanager` key
+cannot grant a principal in another account access. The remote account's
+secret resource policy must trust the provider or reader role, and that role's
+own identity policy must explicitly name the remote secret ARN. The remote key
+policy and the role's identity policy must also allow `kms:Decrypt` for that
+key.
+
+Use the policy matching the selected mode:
+
+| File | Attach to |
+|---|---|
+| [`config/iam/provider-role-cross-account-policy.json`](config/iam/provider-role-cross-account-policy.json) | The provider role in direct-read mode |
+| [`config/iam/atespace-reader-cross-account-policy.json`](config/iam/atespace-reader-cross-account-policy.json) | The reader role in per-atespace mode; never the base provider role |
+
+Replace every remote partition, Region, account, secret-prefix or
+secret-root, KMS-key, and DNS-suffix placeholder. Narrow each direct-mode
+statement to the exact remote prefix that the secret policy grants. In
+per-atespace mode, `REPLACE_WITH_REMOTE_SECRET_ROOT` must end in `/`; remote
+secrets then live under `<root>/<atespace>/`, so both `GetSecretValue` and the
+KMS encryption context remain bound to `${aws:PrincipalTag/ate-atespace}`.
+These identity policies supplement, rather than replace, the remote secret
+resource policy and KMS key policy.
 
 ## Flags
 
@@ -330,23 +385,33 @@ assume any atespace's tag.
 | `--client-ca-file` | required | Trust bundle the caller's certificate must chain to |
 | `--injector-identity` | required | SPIFFE ID of substrate's egress gateway, the only caller the provider accepts; `spiffe://cluster.local/ns/ate-system/sa/atenet-egress` in a default install |
 | `--secret-policy-file` | required | Atespace→secrets policy YAML |
-| `--region` | `AWS_REGION` | The provider's own Region, for STS; secrets are read in the Region their URI names |
+| `--region` | required with Pod Identity | The provider's own Region for STS; secrets are read in the Region their URI names |
 | `--atespace-role-arn` | none | Reader role assumed per atespace ([Per-atespace IAM](#per-atespace-iam)) |
-| `--require-pod-identity` | `true` | Exit at startup unless EKS Pod Identity put credentials in the environment; `false` uses the SDK's default credential chain |
+| `--expected-role-arn` | none | IAM role ARN the startup STS identity must match; the supplied deployment sets it |
+| `--require-pod-identity` | `true` | Use only the EKS Pod Identity endpoint and token file; `false` deliberately restores the SDK's default credential chain for development |
 | `--fetch-timeout` | `2s` | Time limit for one read, two attempts included; keep it under the gateway's 4s injection budget |
-| `--cache-ttl` | `30s` | How long a stage reference is served from memory; `0` turns caching off |
+| `--cache-ttl` | `30s` | How long a stage reference is served from memory; `0` disables stage-value caching |
 | `--version-cache-ttl` | `1h` | How long a version-ID reference is served from memory |
 | `--negative-cache-ttl` | `5s` | How long a `NotFound` or `PermissionDenied` answer is reused |
-| `--cache-max-entries` | `10000` | Most secret versions held in memory per replica |
+| `--cache-max-entries` | `10000` | Most secret versions held in memory per replica; the byte limit can evict sooner |
+| `--cache-max-bytes` | `67108864` | Maximum retained secret payload bytes per replica (64 MiB) |
+| `--fetch-concurrency` | `64` | Maximum distinct concurrent Secrets Manager reads per replica |
+| `--atespace-fetch-concurrency` | `8` | Maximum distinct concurrent reads attributed to one atespace |
+| `--rpc-concurrency` | `128` | Maximum concurrent `FetchSecret` handlers across all client connections |
+| `--grpc-connection-limit` | `16` | Maximum accepted gRPC connections; per-connection streams divide the RPC allowance across this bound |
+| `--max-connection-age` | `5m` | Nominal gRPC connection age; gRPC applies up to 10% jitter before the client reconnects and presents a current certificate |
+| `--max-connection-age-grace` | `30s` | Grace period before closing a connection that reached its maximum age |
 | `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
 | `--drain-grace` | `5s` | How long in-flight calls may finish on shutdown |
 
-At startup the provider checks the flags, loads the policy, checks for Pod
-Identity credentials, loads its certificates, and calls
-`sts:GetCallerIdentity` (which needs no permission) to fail fast without
-credentials and to learn its own account. A secret in that account is read by
-name; a secret in another account is read by its ARN, and the secret's
-resource policy (and a customer managed key) must allow the provider's role.
+At startup the provider checks the flags, loads the policy, constructs the
+explicit Pod Identity credential source, validates its certificate and trust
+bundle, and calls `sts:GetCallerIdentity` (which needs no permission) to fail
+fast without credentials, verify `--expected-role-arn` when set, and learn its
+own account. A secret in that account is read by name; a secret in another
+account is read by its ARN. Cross-account reads require the local identity
+policy, remote secret resource policy, and, for a customer managed key, both
+the local KMS permission and remote key policy described above.
 
 ## Limits
 
@@ -355,8 +420,17 @@ resource policy (and a customer managed key) must allow the provider's role.
 - `BatchGetSecretValue` is not used, and AWS's
   `aws-secretsmanager-caching-go` library is not either: it serves a stale
   value when a refresh fails, and this provider fails closed instead.
+- To disable every cache class, set `--cache-ttl=0`,
+  `--version-cache-ttl=0`, and `--negative-cache-ttl=0`. Setting only
+  `--cache-ttl=0` disables stage-value caching.
 - The policy is read once, at startup: a change needs a restart.
-  Certificates reload when they rotate.
+  Certificates reload when they rotate; readiness strictly parses the serving
+  chain and client trust bundle, checks every certificate's validity, and
+  fails on a missing or invalid Pod Identity token. Each readiness probe also
+  retrieves through the SDK credential cache, so expiration or a transient
+  refresh error triggers a bounded retry without waiting for application
+  traffic. Authenticated gRPC connections are recycled after
+  `--max-connection-age` so rotations apply to existing clients.
 - No metrics endpoint yet.
 
 ## Development

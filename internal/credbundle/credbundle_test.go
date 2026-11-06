@@ -39,7 +39,7 @@ func TestParsePKCS8PrivateKeyBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal PKCS8 key: %v", err)
 	}
-	certDER := generateCertificate(t, 1)
+	certDER := generateCertificateForKey(t, 1, key)
 	bundle := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})...)
 
 	bundlePath := writeBundle(t, bundle)
@@ -321,6 +321,11 @@ func generateRSAKey(t *testing.T) *rsa.PrivateKey {
 
 func generateCertificate(t *testing.T, serial int64) []byte {
 	t.Helper()
+	return generateCertificateForKey(t, serial, generateRSAKey(t))
+}
+
+func generateCertificateForKey(t *testing.T, serial int64, key *rsa.PrivateKey) []byte {
+	t.Helper()
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(serial),
 		Subject:      pkix.Name{CommonName: "api.ate-system.svc"},
@@ -328,10 +333,28 @@ func generateCertificate(t *testing.T, serial int64) []byte {
 		NotAfter:     time.Now().Add(time.Hour),
 		DNSNames:     []string{"api.ate-system.svc"},
 	}
-	key := generateRSAKey(t)
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
 		t.Fatalf("create certificate: %v", err)
+	}
+	return der
+}
+
+func generateCACertificate(t *testing.T, serial int64) []byte {
+	t.Helper()
+	key := generateRSAKey(t)
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: "client-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create CA certificate: %v", err)
 	}
 	return der
 }
@@ -349,12 +372,13 @@ func writeBundle(t *testing.T, bundle []byte) string {
 // can tell bundles apart.
 func makeBundle(t *testing.T, serial int64) []byte {
 	t.Helper()
-	keyDER, err := x509.MarshalPKCS8PrivateKey(generateRSAKey(t))
+	key := generateRSAKey(t)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		t.Fatalf("marshal PKCS8 key: %v", err)
 	}
 	return append(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificate(t, serial)}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificateForKey(t, serial, key)}),
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})...,
 	)
 }
@@ -362,7 +386,7 @@ func makeBundle(t *testing.T, serial int64) []byte {
 // makeTrustBundle returns a one-certificate trust bundle carrying serial.
 func makeTrustBundle(t *testing.T, serial int64) []byte {
 	t.Helper()
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificate(t, serial)})
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCACertificate(t, serial)})
 }
 
 func leafSerial(t *testing.T, cert *tls.Certificate) int64 {
@@ -426,4 +450,86 @@ func rotateProjectedBundle(path string, bundle []byte) error {
 		return fmt.Errorf("remove old payload dir: %w", err)
 	}
 	return nil
+}
+
+func TestParseRejectsMismatchedAndDuplicatePrivateKeys(t *testing.T) {
+	key := generateRSAKey(t)
+	other := generateRSAKey(t)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherDER, err := x509.MarshalPKCS8PrivateKey(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificateForKey(t, 1, key)})
+
+	mismatched := append(append([]byte{}, certPEM...), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: otherDER})...)
+	if _, err := Parse(writeBundle(t, mismatched)); err == nil {
+		t.Fatal("Parse accepted a private key that does not match the leaf certificate")
+	}
+
+	duplicate := append(append(append([]byte{}, certPEM...), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})...), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: otherDER})...)
+	if _, err := Parse(writeBundle(t, duplicate)); err == nil {
+		t.Fatal("Parse accepted more than one private key")
+	}
+}
+
+func TestParseRejectsPKCS1DERMislabeledAsPrivateKey(t *testing.T) {
+	key := generateRSAKey(t)
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificateForKey(t, 1, key)})
+	mislabeled := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if _, err := Parse(writeBundle(t, append(cert, mislabeled...))); err == nil {
+		t.Fatal("Parse accepted PKCS#1 DER in a PRIVATE KEY block")
+	}
+}
+
+func TestParseRejectsMalformedCertificateAndTrailingData(t *testing.T) {
+	malformedCertificate := append(makeBundle(t, 1), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not DER")})...)
+	if _, err := Parse(writeBundle(t, malformedCertificate)); err == nil {
+		t.Fatal("Parse accepted a malformed additional certificate")
+	}
+	for name, bundle := range map[string][]byte{
+		"leading":      append([]byte("not PEM"), makeBundle(t, 1)...),
+		"interstitial": append(append(makeBundle(t, 1), []byte("not PEM")...), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCACertificate(t, 2)})...),
+		"trailing":     append(makeBundle(t, 1), []byte("not PEM")...),
+	} {
+		if _, err := Parse(writeBundle(t, bundle)); err == nil {
+			t.Errorf("Parse accepted %s non-PEM data", name)
+		}
+	}
+
+	leafKey := generateRSAKey(t)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongChain := append(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificateForKey(t, 3, leafKey)}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCACertificate(t, 4)})...,
+	)
+	wrongChain = append(wrongChain, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})...)
+	if _, err := Parse(writeBundle(t, wrongChain)); err == nil {
+		t.Fatal("Parse accepted a serving chain whose certificates are not linked")
+	}
+}
+
+func TestParsePoolRejectsPartiallyMalformedAndNonCABundles(t *testing.T) {
+	partial := append(makeTrustBundle(t, 1), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not DER")})...)
+	if _, err := ParsePool(writeBundle(t, partial)); err == nil {
+		t.Fatal("ParsePool accepted a partially malformed trust bundle")
+	}
+	nonCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificate(t, 1)})
+	if _, err := ParsePool(writeBundle(t, nonCA)); err == nil {
+		t.Fatal("ParsePool accepted a non-CA certificate")
+	}
+	for name, bundle := range map[string][]byte{
+		"leading":  append([]byte("not PEM"), makeTrustBundle(t, 1)...),
+		"trailing": append(makeTrustBundle(t, 1), []byte("not PEM")...),
+	} {
+		if _, err := ParsePool(writeBundle(t, bundle)); err == nil {
+			t.Errorf("ParsePool accepted %s non-PEM data", name)
+		}
+	}
 }

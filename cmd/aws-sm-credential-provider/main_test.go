@@ -30,7 +30,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	"go.ate.dev/substrate/api/credprovider/v1"
@@ -66,6 +68,14 @@ func TestHealthHandler(t *testing.T) {
 	if got := get("/healthz"); got != http.StatusOK {
 		t.Errorf("/healthz while draining = %d, want 200", got)
 	}
+
+	ready.Store(true)
+	broken := healthHandler(&ready, func() error { return errors.New("rotated bundle is invalid") })
+	rec := httptest.NewRecorder()
+	broken.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("/readyz with failed dependency = %d, want 503", rec.Code)
+	}
 }
 
 // setFlags sets command-line flags for one test and restores every flag after.
@@ -99,6 +109,7 @@ func TestRunRefusesBadConfiguration(t *testing.T) {
 		"client-ca-file":     "/ca.pem",
 		"injector-identity":  caller,
 		"secret-policy-file": policy,
+		"region":             "us-west-2",
 	}
 	with := func(changes map[string]string) map[string]string {
 		m := map[string]string{}
@@ -110,7 +121,11 @@ func TestRunRefusesBadConfiguration(t *testing.T) {
 		}
 		return m
 	}
-	const podID = "http://169.254.170.23/v1/credentials"
+	const podID = podIdentityEndpointIPv4
+	tokenFile := filepath.Join(t.TempDir(), "pod-identity-token")
+	if err := os.WriteFile(tokenFile, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name  string
 		flags map[string]string
@@ -126,9 +141,18 @@ func TestRunRefusesBadConfiguration(t *testing.T) {
 		{name: "fetch timeout not positive", flags: with(map[string]string{"fetch-timeout": "0s"}), wantErr: "--fetch-timeout"},
 		{name: "negative cache TTL", flags: with(map[string]string{"negative-cache-ttl": "-1s"}), wantErr: "must not be negative"},
 		{name: "no cache entries", flags: with(map[string]string{"cache-max-entries": "0"}), wantErr: "--cache-max-entries"},
+		{name: "required Pod Identity needs explicit region", flags: with(map[string]string{"region": ""}), wantErr: "--region"},
+		{name: "no cache bytes", flags: with(map[string]string{"cache-max-bytes": "0"}), wantErr: "--cache-max-bytes"},
+		{name: "no fetch concurrency", flags: with(map[string]string{"fetch-concurrency": "0"}), wantErr: "--fetch-concurrency"},
+		{name: "atespace concurrency exceeds global", flags: with(map[string]string{"fetch-concurrency": "2", "atespace-fetch-concurrency": "3"}), wantErr: "--atespace-fetch-concurrency"},
+		{name: "no RPC concurrency", flags: with(map[string]string{"rpc-concurrency": "0"}), wantErr: "--rpc-concurrency"},
+		{name: "too many gRPC connections", flags: with(map[string]string{"rpc-concurrency": "2", "grpc-connection-limit": "3"}), wantErr: "--grpc-connection-limit"},
+		{name: "no maximum connection age", flags: with(map[string]string{"max-connection-age": "0s"}), wantErr: "--max-connection-age"},
+		{name: "zero connection age grace", flags: with(map[string]string{"max-connection-age-grace": "0s"}), wantErr: "--max-connection-age"},
 		{name: "region not a region", flags: with(map[string]string{"region": "REPLACE_WITH_AWS_REGION"}), wantErr: "--region"},
 		{name: "region an endpoint", flags: with(map[string]string{"region": "evil.example.com"}), wantErr: "--region"},
 		{name: "role not an IAM role", flags: with(map[string]string{"atespace-role-arn": "arn:aws:iam::111122223333:user/x"}), wantErr: "--atespace-role-arn"},
+		{name: "expected role not an IAM role", flags: with(map[string]string{"expected-role-arn": "arn:aws:iam::111122223333:user/x"}), wantErr: "--expected-role-arn"},
 		{name: "secret policy unreadable", flags: with(map[string]string{"secret-policy-file": absent}), podID: podID, wantErr: "secret policy", wantIs: fs.ErrNotExist},
 		{name: "no Pod Identity credentials", flags: good, wantErr: "Pod Identity"},
 		{name: "client CA unreadable", flags: with(map[string]string{"client-ca-file": absent}), podID: podID, wantErr: "server credentials", wantIs: fs.ErrNotExist},
@@ -137,6 +161,10 @@ func TestRunRefusesBadConfiguration(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setFlags(t, tc.flags)
 			t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", tc.podID)
+			t.Setenv("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", tokenFile)
+			for _, name := range credentialEnvironmentConflicts {
+				t.Setenv(name, "")
+			}
 
 			err := run(context.Background())
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -285,5 +313,51 @@ func TestGracefulStopForcesAfterGrace(t *testing.T) {
 	}
 	if err := <-result; err == nil {
 		t.Error("in-flight FetchSecret succeeded, want it cut off")
+	}
+}
+
+func TestLimitUnaryRPCsBoundsProcessHandlers(t *testing.T) {
+	interceptor := limitUnaryRPCs(1)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	first := make(chan error, 1)
+	handler := func(context.Context, any) (any, error) {
+		close(entered)
+		<-release
+		return "ok", nil
+	}
+	go func() {
+		_, err := interceptor(context.Background(), nil, nil, handler)
+		first <- err
+	}()
+	<-entered
+
+	if _, err := interceptor(context.Background(), nil, nil, func(context.Context, any) (any, error) {
+		return "unexpected", nil
+	}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("second RPC = %v, want Unavailable", err)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := interceptor(context.Background(), nil, nil, func(context.Context, any) (any, error) {
+		return "after-release", nil
+	}); err != nil || got != "after-release" {
+		t.Fatalf("RPC after release = %v, %v", got, err)
+	}
+}
+
+func TestStreamsPerConnection(t *testing.T) {
+	for _, tc := range []struct {
+		total, connections, want int
+	}{
+		{total: 128, connections: 16, want: 8},
+		{total: 10, connections: 3, want: 4},
+		{total: 1, connections: 1, want: 1},
+	} {
+		if got := streamsPerConnection(tc.total, tc.connections); got != tc.want {
+			t.Errorf("streamsPerConnection(%d, %d) = %d, want %d", tc.total, tc.connections, got, tc.want)
+		}
 	}
 }

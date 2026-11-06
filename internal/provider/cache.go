@@ -37,8 +37,15 @@ type CacheConfig struct {
 	// InvalidArgument answers, so a broken policy cannot burn the account's
 	// GetSecretValue quota. Unavailable and DeadlineExceeded are never cached.
 	NegativeTTL time.Duration
-	// MaxEntries bounds memory: a value is at most 64 KiB.
+	// MaxEntries limits cache bookkeeping independently of payload sizes.
 	MaxEntries int
+	// MaxBytes is the maximum total payload bytes retained. Entries larger
+	// than the entire budget are returned but never cached.
+	MaxBytes int64
+	// MaxInflight limits distinct Secrets Manager reads across the process.
+	MaxInflight int
+	// MaxInflightPerScope limits distinct reads attributed to one atespace.
+	MaxInflightPerScope int
 }
 
 type cacheKey struct {
@@ -58,6 +65,7 @@ type entry struct {
 	val     []byte
 	err     error
 	expires time.Time
+	size    int64
 	elem    *list.Element
 }
 
@@ -73,42 +81,84 @@ type Cache struct {
 	fetchTimeout time.Duration
 	now          func() time.Time
 
-	mu       sync.Mutex
-	entries  map[cacheKey]*entry
-	lru      *list.List // front = most recent
-	inflight map[cacheKey]*flight
+	mu              sync.Mutex
+	entries         map[cacheKey]*entry
+	lru             *list.List // front = most recent
+	inflight        map[cacheKey]*flight
+	inflightTotal   int
+	inflightByScope map[string]int
+	slotsChanged    chan struct{}
+	totalBytes      int64
 }
 
 func NewCache(cfg CacheConfig, fetchTimeout time.Duration) *Cache {
 	if cfg.MaxEntries <= 0 {
 		cfg.MaxEntries = 10000
 	}
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = 64 << 20
+	}
+	if cfg.MaxInflight <= 0 {
+		cfg.MaxInflight = 64
+	}
+	if cfg.MaxInflightPerScope <= 0 {
+		cfg.MaxInflightPerScope = 8
+	}
 	return &Cache{cfg: cfg, fetchTimeout: fetchTimeout, now: time.Now,
-		entries: map[cacheKey]*entry{}, lru: list.New(), inflight: map[cacheKey]*flight{}}
+		entries: map[cacheKey]*entry{}, lru: list.New(), inflight: map[cacheKey]*flight{},
+		inflightByScope: map[string]int{}, slotsChanged: make(chan struct{})}
 }
 
 // Get returns the cached payload for k, or calls fetch once for all concurrent
-// callers. fetch runs on a context detached from the first caller's
+// callers. scope attributes new work to an atespace for fair admission; it is
+// separate from k because direct-role mode may safely share values across
+// atespaces. fetch runs on a context detached from the first caller's
 // cancellation, bounded by the fetch timeout, so one impatient caller does not
 // fail the others waiting on the same key.
-func (c *Cache) Get(ctx context.Context, k cacheKey, fetch func(context.Context) ([]byte, error)) ([]byte, error) {
-	c.mu.Lock()
-	if e, ok := c.entries[k]; ok {
-		if c.now().Before(e.expires) {
-			c.lru.MoveToFront(e.elem)
-			c.mu.Unlock()
-			return e.val, e.err
-		}
-		c.removeLocked(e)
-	}
-	f, ok := c.inflight[k]
-	if !ok {
-		f = &flight{done: make(chan struct{})}
-		c.inflight[k] = f
-		go c.run(ctx, k, f, fetch)
-	}
-	c.mu.Unlock()
+func (c *Cache) Get(ctx context.Context, scope string, k cacheKey, fetch func(context.Context) ([]byte, error)) ([]byte, error) {
+	admissionCtx, cancelAdmission := context.WithTimeout(ctx, c.fetchTimeout)
+	defer cancelAdmission()
 
+	for {
+		c.mu.Lock()
+		if e, ok := c.entries[k]; ok {
+			if c.now().Before(e.expires) {
+				c.lru.MoveToFront(e.elem)
+				c.mu.Unlock()
+				return e.val, e.err
+			}
+			c.removeLocked(e)
+		}
+		if f, ok := c.inflight[k]; ok {
+			c.mu.Unlock()
+			return waitForFlight(ctx, f)
+		}
+		if c.inflightTotal < c.cfg.MaxInflight && c.inflightByScope[scope] < c.cfg.MaxInflightPerScope {
+			f := &flight{done: make(chan struct{})}
+			c.inflight[k] = f
+			c.inflightTotal++
+			c.inflightByScope[scope]++
+			go c.run(ctx, scope, k, f, fetch)
+			c.mu.Unlock()
+			return waitForFlight(ctx, f)
+		}
+		changed := c.slotsChanged
+		c.mu.Unlock()
+
+		select {
+		case <-changed:
+			// Recheck the cache, coalescing map and both limits under the lock.
+			continue
+		case <-admissionCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return nil, status.FromContextError(err).Err()
+			}
+			return nil, status.Error(codes.Unavailable, "Secrets Manager read concurrency limit reached")
+		}
+	}
+}
+
+func waitForFlight(ctx context.Context, f *flight) ([]byte, error) {
 	select {
 	case <-f.done:
 		return f.val, f.err
@@ -117,7 +167,7 @@ func (c *Cache) Get(ctx context.Context, k cacheKey, fetch func(context.Context)
 	}
 }
 
-func (c *Cache) run(ctx context.Context, k cacheKey, f *flight, fetch func(context.Context) ([]byte, error)) {
+func (c *Cache) run(ctx context.Context, scope string, k cacheKey, f *flight, fetch func(context.Context) ([]byte, error)) {
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
 	defer cancel()
 	f.val, f.err = fetch(fctx)
@@ -125,15 +175,26 @@ func (c *Cache) run(ctx context.Context, k cacheKey, f *flight, fetch func(conte
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.inflight, k)
+	c.inflightTotal--
+	c.inflightByScope[scope]--
+	if c.inflightByScope[scope] == 0 {
+		delete(c.inflightByScope, scope)
+	}
 	// Cache before waking waiters, so a caller's next request is a hit.
 	if ttl := c.ttlFor(k, f.err); ttl > 0 {
-		e := &entry{key: k, val: f.val, err: f.err, expires: c.now().Add(ttl)}
-		e.elem = c.lru.PushFront(e)
-		c.entries[k] = e
-		for c.lru.Len() > c.cfg.MaxEntries {
-			c.removeLocked(c.lru.Back().Value.(*entry))
+		size := int64(len(f.val))
+		if size <= c.cfg.MaxBytes {
+			e := &entry{key: k, val: f.val, err: f.err, expires: c.now().Add(ttl), size: size}
+			e.elem = c.lru.PushFront(e)
+			c.entries[k] = e
+			c.totalBytes += size
+			for c.lru.Len() > c.cfg.MaxEntries || c.totalBytes > c.cfg.MaxBytes {
+				c.removeLocked(c.lru.Back().Value.(*entry))
+			}
 		}
 	}
+	close(c.slotsChanged)
+	c.slotsChanged = make(chan struct{})
 	close(f.done)
 }
 
@@ -155,6 +216,7 @@ func (c *Cache) ttlFor(k cacheKey, err error) time.Duration {
 func (c *Cache) removeLocked(e *entry) {
 	c.lru.Remove(e.elem)
 	delete(c.entries, e.key)
+	c.totalBytes -= e.size
 }
 
 // Len is the number of cached entries (for tests and metrics).
@@ -162,4 +224,11 @@ func (c *Cache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lru.Len()
+}
+
+// Bytes is the number of secret payload bytes currently retained.
+func (c *Cache) Bytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.totalBytes
 }

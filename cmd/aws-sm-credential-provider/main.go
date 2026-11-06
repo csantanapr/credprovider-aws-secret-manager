@@ -39,7 +39,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"golang.org/x/net/netutil"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 
 	"go.ate.dev/substrate/api/credprovider/v1"
 
@@ -56,17 +60,25 @@ var (
 	// the deployment.
 	injectorIdentity = flag.String("injector-identity", "", "SPIFFE ID the caller's client certificate must carry: substrate's egress gateway, e.g. spiffe://<trust-domain>/ns/<namespace>/sa/atenet-egress (required)")
 	policyFile       = flag.String("secret-policy-file", "", "path to the atespace→secrets authorization YAML (required)")
-	awsRegion        = flag.String("region", "", "the provider's own AWS Region, for STS; empty uses AWS_REGION")
+	awsRegion        = flag.String("region", "", "the provider's own AWS Region, for STS; required with --require-pod-identity")
 	atespaceRoleARN  = flag.String("atespace-role-arn", "", "optional IAM role assumed once per atespace with an ate-atespace session tag, so IAM also enforces atespace isolation")
-	requirePodID     = flag.Bool("require-pod-identity", true, "exit unless EKS Pod Identity put credentials in the environment")
+	expectedRoleARN  = flag.String("expected-role-arn", "", "optional IAM role ARN the Pod Identity credentials must resolve to")
+	requirePodID     = flag.Bool("require-pod-identity", true, "use only EKS Pod Identity credentials and exit if they are unavailable")
 	logLevel         = flag.String("log-level", "info", "one of debug, info, warn, error")
 	drainGrace       = flag.Duration("drain-grace", 5*time.Second, "how long to wait for in-flight RPCs on shutdown before a hard stop")
+	maxConnAge       = flag.Duration("max-connection-age", 5*time.Minute, "maximum age of an authenticated gRPC connection; keep below the client certificate lifetime")
+	maxConnAgeGrace  = flag.Duration("max-connection-age-grace", 30*time.Second, "grace after maximum connection age before the server closes the connection")
 	// The egress gateway gives all of a request's injections 4s together.
-	fetchTimeout = flag.Duration("fetch-timeout", 2*time.Second, "how long one GetSecretValue may take, retries included; keep it under the egress gateway's 4s injection budget")
-	stageTTL     = flag.Duration("cache-ttl", 30*time.Second, "how long a stage reference (AWSCURRENT, ...) is served from memory; bounds the rotation lag; 0 disables caching")
-	versionTTL   = flag.Duration("version-cache-ttl", time.Hour, "how long a version-ID reference, which never changes, is served from memory")
-	negativeTTL  = flag.Duration("negative-cache-ttl", 5*time.Second, "how long a NotFound or PermissionDenied answer is reused")
-	cacheEntries = flag.Int("cache-max-entries", 10000, "most secret versions held in memory (each at most 64 KiB)")
+	fetchTimeout     = flag.Duration("fetch-timeout", 2*time.Second, "how long one GetSecretValue may take, retries included; keep it under the egress gateway's 4s injection budget")
+	stageTTL         = flag.Duration("cache-ttl", 30*time.Second, "how long a stage reference (AWSCURRENT, ...) is served from memory; bounds the rotation lag; 0 disables stage-value caching")
+	versionTTL       = flag.Duration("version-cache-ttl", time.Hour, "how long a version-ID reference, which never changes, is served from memory")
+	negativeTTL      = flag.Duration("negative-cache-ttl", 5*time.Second, "how long a NotFound or PermissionDenied answer is reused")
+	cacheEntries     = flag.Int("cache-max-entries", 10000, "most secret versions held in memory")
+	cacheBytes       = flag.Int64("cache-max-bytes", 64<<20, "maximum secret payload bytes held in memory")
+	fetchConcurrency = flag.Int("fetch-concurrency", 64, "maximum concurrent Secrets Manager reads")
+	atespaceFetches  = flag.Int("atespace-fetch-concurrency", 8, "maximum concurrent Secrets Manager reads for one atespace")
+	rpcConcurrency   = flag.Int("rpc-concurrency", 128, "maximum concurrent FetchSecret RPC handlers across all connections")
+	grpcConnections  = flag.Int("grpc-connection-limit", 16, "maximum accepted gRPC connections")
 )
 
 // version is set at build time with -ldflags "-X main.version=v0.1.0".
@@ -111,10 +123,26 @@ func checkFlags() error {
 		return errors.New("--cache-ttl, --version-cache-ttl and --negative-cache-ttl must not be negative")
 	case *cacheEntries <= 0:
 		return fmt.Errorf("--cache-max-entries must be positive, got %d", *cacheEntries)
+	case *cacheBytes <= 0:
+		return fmt.Errorf("--cache-max-bytes must be positive, got %d", *cacheBytes)
+	case *fetchConcurrency <= 0:
+		return fmt.Errorf("--fetch-concurrency must be positive, got %d", *fetchConcurrency)
+	case *atespaceFetches <= 0 || *atespaceFetches > *fetchConcurrency:
+		return fmt.Errorf("--atespace-fetch-concurrency must be positive and no greater than --fetch-concurrency, got %d and %d", *atespaceFetches, *fetchConcurrency)
+	case *rpcConcurrency <= 0:
+		return fmt.Errorf("--rpc-concurrency must be positive, got %d", *rpcConcurrency)
+	case *grpcConnections <= 0 || *grpcConnections > *rpcConcurrency:
+		return fmt.Errorf("--grpc-connection-limit must be positive and no greater than --rpc-concurrency, got %d and %d", *grpcConnections, *rpcConcurrency)
+	case *maxConnAge <= 0 || *maxConnAgeGrace <= 0:
+		return fmt.Errorf("--max-connection-age and --max-connection-age-grace must be positive, got %v and %v", *maxConnAge, *maxConnAgeGrace)
+	case *requirePodID && *awsRegion == "":
+		return fmt.Errorf("--region is required when --require-pod-identity=true")
 	case *awsRegion != "" && !provider.ValidRegion(*awsRegion):
 		return fmt.Errorf("--region %q is not a region such as us-west-2", *awsRegion)
 	case *atespaceRoleARN != "" && !roleARN.MatchString(*atespaceRoleARN):
 		return fmt.Errorf("--atespace-role-arn %q is not an IAM role ARN", *atespaceRoleARN)
+	case *expectedRoleARN != "" && !roleARN.MatchString(*expectedRoleARN):
+		return fmt.Errorf("--expected-role-arn %q is not an IAM role ARN", *expectedRoleARN)
 	}
 	return nil
 }
@@ -129,19 +157,23 @@ func run(ctx context.Context) error {
 	}
 	slog.Info("loaded secret authorization policy", slog.String("file", *policyFile), slog.Int("atespaces", authz.Atespaces()))
 
-	// The Pod Identity webhook adds these only when a pod is created. A pod
-	// that started before its association existed never gets them, so exit
-	// and let it be restarted, rather than fall through to IMDS (blocked by a
-	// hop limit of 1 on EKS nodes) and fail every request slowly.
-	if *requirePodID && os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") == "" {
-		return errors.New("no EKS Pod Identity credentials in the environment: create the Pod Identity association for this ServiceAccount, then restart the pod (or pass --require-pod-identity=false to use other AWS credentials)")
+	// Required mode constructs the EKS container credential provider directly.
+	// This prevents static environment, web-identity, shared-profile and IMDS
+	// credentials from taking precedence in the SDK's default chain.
+	var requiredCredentials *podIdentityCredentialProvider
+	if *requirePodID {
+		requiredCredentials, err = podIdentityCredentials()
+		if err != nil {
+			return fmt.Errorf("EKS Pod Identity credentials: %w", err)
+		}
 	}
 
-	creds, err := mtls.ServerCredentials(mtls.Config{
+	mtlsConfig := mtls.Config{
 		ServerBundle:   *serverBundle,
 		ClientCAFile:   *clientCAFile,
 		CallerIdentity: *injectorIdentity,
-	})
+	}
+	creds, err := mtls.ServerCredentials(mtlsConfig)
 	if err != nil {
 		return fmt.Errorf("server credentials: %w", err)
 	}
@@ -152,6 +184,9 @@ func run(ctx context.Context) error {
 		// itself, but answers Unavailable with a retryable 503.
 		config.WithRetryer(func() aws.Retryer { return retry.AddWithMaxAttempts(retry.NewStandard(), 2) }),
 	}
+	if requiredCredentials != nil {
+		opts = append(opts, requiredPodIdentityConfigOptions(requiredCredentials)...)
+	}
 	if *awsRegion != "" {
 		opts = append(opts, config.WithRegion(*awsRegion))
 	}
@@ -160,7 +195,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("aws config: %w", err)
 	}
 	if !provider.ValidRegion(cfg.Region) {
-		return fmt.Errorf("no AWS Region: set --region or AWS_REGION (got %q)", cfg.Region)
+		return fmt.Errorf("no AWS Region: set --region, or AWS_REGION only when --require-pod-identity=false (got %q)", cfg.Region)
 	}
 	// Fail startup if no credentials resolve, and learn the home account.
 	// GetCallerIdentity needs no grant.
@@ -171,6 +206,9 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("resolving the provider's AWS identity: %w", err)
 	}
 	homeAccount := aws.ToString(id.Account)
+	if *expectedRoleARN != "" && !matchesExpectedRole(*expectedRoleARN, aws.ToString(id.Arn)) {
+		return fmt.Errorf("AWS identity %q is not the expected role %q", aws.ToString(id.Arn), *expectedRoleARN)
+	}
 	if m := roleARN.FindStringSubmatch(*atespaceRoleARN); m != nil {
 		// The reader role's sessions read the secrets, so its account is the
 		// one where a bare name resolves.
@@ -180,12 +218,31 @@ func run(ctx context.Context) error {
 		slog.String("home_account", homeAccount), slog.String("atespace_role", *atespaceRoleARN))
 
 	pool := &clientPool{base: cfg, atespaceRoleARN: *atespaceRoleARN, sts: sts.NewFromConfig(cfg)}
-	cache := provider.NewCache(provider.CacheConfig{StageTTL: *stageTTL, VersionTTL: *versionTTL,
-		NegativeTTL: *negativeTTL, MaxEntries: *cacheEntries}, *fetchTimeout)
+	cache := provider.NewCache(provider.CacheConfig{
+		StageTTL:            *stageTTL,
+		VersionTTL:          *versionTTL,
+		NegativeTTL:         *negativeTTL,
+		MaxEntries:          *cacheEntries,
+		MaxBytes:            *cacheBytes,
+		MaxInflight:         *fetchConcurrency,
+		MaxInflightPerScope: *atespaceFetches,
+	}, *fetchTimeout)
 	slog.Info("cache", slog.Duration("stage_ttl", *stageTTL), slog.Duration("version_ttl", *versionTTL),
-		slog.Duration("negative_ttl", *negativeTTL), slog.Int("max_entries", *cacheEntries))
+		slog.Duration("negative_ttl", *negativeTTL), slog.Int("max_entries", *cacheEntries),
+		slog.Int64("max_bytes", *cacheBytes), slog.Int("fetch_concurrency", *fetchConcurrency),
+		slog.Int("atespace_fetch_concurrency", *atespaceFetches))
 
-	srv := grpc.NewServer(grpc.Creds(creds))
+	srv := grpc.NewServer(
+		grpc.Creds(creds),
+		grpc.MaxRecvMsgSize(4<<10),
+		grpc.MaxHeaderListSize(8<<10),
+		grpc.MaxConcurrentStreams(uint32(streamsPerConnection(*rpcConcurrency, *grpcConnections))),
+		grpc.UnaryInterceptor(limitUnaryRPCs(*rpcConcurrency)),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionAge:      *maxConnAge,
+			MaxConnectionAgeGrace: *maxConnAgeGrace,
+		}),
+	)
 	credprovider.RegisterCredentialProviderServer(srv,
 		provider.NewServer(pool.For, authz, cache, homeAccount, *atespaceRoleARN != ""))
 
@@ -193,12 +250,20 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listenAddr, err)
 	}
+	grpcLis = netutil.LimitListener(grpcLis, *grpcConnections)
 	healthLis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *healthAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *healthAddr, err)
 	}
 	var ready atomic.Bool
-	healthSrv := &http.Server{Handler: healthHandler(&ready), ReadHeaderTimeout: 10 * time.Second}
+	readinessChecks := []func() error{mtls.HealthCheck(mtlsConfig)}
+	if requiredCredentials != nil {
+		readinessChecks = append(readinessChecks, credentialReadinessCheck(cfg.Credentials, requiredCredentials))
+	}
+	healthSrv := &http.Server{
+		Handler:           healthHandler(&ready, readinessChecks...),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	healthDone := make(chan error, 1)
 	go func() { healthDone <- healthSrv.Serve(healthLis) }()
 
@@ -228,6 +293,33 @@ func run(ctx context.Context) error {
 	return <-shutdownErr
 }
 
+func streamsPerConnection(totalRPCs, connections int) int {
+	streams := totalRPCs / connections
+	if totalRPCs%connections != 0 {
+		streams++
+	}
+	if streams < 1 {
+		return 1
+	}
+	return streams
+}
+
+// limitUnaryRPCs bounds handler goroutines across every accepted connection.
+// It rejects excess calls immediately so queued metadata cannot consume the
+// process memory reserved for admitted work.
+func limitUnaryRPCs(max int) grpc.UnaryServerInterceptor {
+	semaphore := make(chan struct{}, max)
+	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		select {
+		case semaphore <- struct{}{}:
+			defer func() { <-semaphore }()
+			return handler(ctx, req)
+		default:
+			return nil, status.Error(codes.Unavailable, "RPC concurrency limit reached")
+		}
+	}
+}
+
 // gracefulStop lets in-flight RPCs finish for up to grace, then forces the
 // server down.
 func gracefulStop(srv *grpc.Server, grace time.Duration) {
@@ -245,8 +337,8 @@ func gracefulStop(srv *grpc.Server, grace time.Duration) {
 }
 
 // healthHandler serves /healthz, which always succeeds so a draining pod is not
-// restarted, and /readyz, which succeeds only while ready is set.
-func healthHandler(ready *atomic.Bool) http.Handler {
+// restarted, and /readyz, which also checks the live credential projections.
+func healthHandler(ready *atomic.Bool, checks ...func() error) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -255,6 +347,13 @@ func healthHandler(ready *atomic.Bool) http.Handler {
 		if !ready.Load() {
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
 			return
+		}
+		for _, check := range checks {
+			if err := check(); err != nil {
+				slog.Warn("readiness check failed", slog.Any("err", err))
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		_, _ = w.Write([]byte("ok"))
 	})

@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -84,7 +83,7 @@ func (s *Server) FetchSecret(ctx context.Context, req *credprovider.FetchSecretR
 	if s.scopeCacheByAtespace {
 		scope = atespace
 	}
-	payload, err := s.cache.Get(ctx, keyFor(scope, ref), func(fctx context.Context) ([]byte, error) {
+	payload, err := s.cache.Get(ctx, atespace, keyFor(scope, ref), func(fctx context.Context) ([]byte, error) {
 		return s.read(fctx, atespace, ref)
 	})
 	if err == nil && ref.Key != "" {
@@ -119,10 +118,13 @@ func (s *Server) read(ctx context.Context, atespace string, ref SecretRef) ([]by
 	if err != nil {
 		return nil, accessError(ref, err)
 	}
-	// A name ending in -XXXXXX can be taken for a full ARN; refuse anything
-	// but the account, region and name the URI names.
-	if !strings.HasPrefix(aws.ToString(out.ARN), ref.ARNPrefix()) {
+	// A partial ARN can resolve ambiguously when a secret name resembles an
+	// ARN suffix. Require both the exact returned name and complete ARN shape.
+	if !ref.MatchesSecretIdentity(aws.ToString(out.Name), aws.ToString(out.ARN)) {
 		return nil, status.Errorf(codes.PermissionDenied, "%s resolved to a different secret", ref)
+	}
+	if !ref.MatchesSecretVersion(aws.ToString(out.VersionId), out.VersionStages) {
+		return nil, status.Errorf(codes.PermissionDenied, "%s resolved to a different version", ref)
 	}
 	switch {
 	case out.SecretBinary != nil:
@@ -148,25 +150,25 @@ func accessError(ref SecretRef, err error) error {
 		// Credential retrieval (Pod Identity agent), DNS, TLS: transient.
 		return status.Errorf(codes.Unavailable, "%s: %v", ref, err)
 	}
-	msg := ae.ErrorCode() + ": " + ae.ErrorMessage()
-	switch ae.ErrorCode() {
+	code := ae.ErrorCode()
+	switch code {
 	case "ResourceNotFoundException":
 		return status.Errorf(codes.NotFound, "%s not found", ref)
 	case "AccessDeniedException", "UnrecognizedClientException", "InvalidSignatureException",
 		// STS's code, when the per-atespace reader role refuses the provider.
 		"AccessDenied":
-		return status.Errorf(codes.PermissionDenied, "not permitted to read %s: %s", ref, msg)
+		return status.Errorf(codes.PermissionDenied, "not permitted to read %s (%s)", ref, code)
 	case "DecryptionFailure":
 		// No kms:Decrypt on the secret's key, or the key is disabled.
-		return status.Errorf(codes.PermissionDenied, "cannot decrypt %s: %s", ref, msg)
+		return status.Errorf(codes.PermissionDenied, "cannot decrypt %s (%s)", ref, code)
 	case "InvalidRequestException":
 		// For example a secret scheduled for deletion.
-		return status.Errorf(codes.FailedPrecondition, "reading %s: %s", ref, msg)
+		return status.Errorf(codes.FailedPrecondition, "reading %s failed (%s)", ref, code)
 	case "InvalidParameterException", "ValidationException":
-		return status.Errorf(codes.InvalidArgument, "reading %s: %s", ref, msg)
+		return status.Errorf(codes.InvalidArgument, "reading %s failed (%s)", ref, code)
 	default:
 		// ThrottlingException, InternalServiceError, unknown: retryable.
-		return status.Errorf(codes.Unavailable, "reading %s: %s", ref, msg)
+		return status.Errorf(codes.Unavailable, "reading %s failed (%s)", ref, code)
 	}
 }
 

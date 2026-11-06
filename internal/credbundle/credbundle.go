@@ -21,6 +21,7 @@
 package credbundle
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -118,69 +119,126 @@ func (c *poolCache) get() (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// Parse reads the PKCS#8 private key and certificate chain from a credential
-// bundle file.
+// Parse reads the single PKCS#8 private key and certificate chain from a
+// credential bundle file, and verifies that the private key matches the leaf.
 func Parse(bundlePath string) (*tls.Certificate, error) {
 	bundleBytes, err := os.ReadFile(bundlePath)
 	if err != nil {
 		return nil, fmt.Errorf("while reading credential bundle: %w", err)
 	}
 
-	var leafKeyBytes []byte
-	var chainBytes [][]byte
-
+	var certPEM, keyPEM []byte
 	for {
+		bundleBytes = bytes.TrimSpace(bundleBytes)
+		if len(bundleBytes) == 0 {
+			break
+		}
+		if !bytes.HasPrefix(bundleBytes, []byte("-----BEGIN ")) {
+			return nil, fmt.Errorf("credential bundle contains malformed non-PEM data")
+		}
 		var block *pem.Block
 		block, bundleBytes = pem.Decode(bundleBytes)
 		if block == nil {
-			break
+			return nil, fmt.Errorf("credential bundle contains malformed PEM data")
 		}
 
 		switch block.Type {
 		case "CERTIFICATE":
-			chainBytes = append(chainBytes, block.Bytes)
+			if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+				return nil, fmt.Errorf("while parsing certificate: %w", err)
+			}
+			certPEM = append(certPEM, pem.EncodeToMemory(block)...)
 		case "PRIVATE KEY":
-			leafKeyBytes = block.Bytes
+			if keyPEM != nil {
+				return nil, fmt.Errorf("more than one PRIVATE KEY block found")
+			}
+			if _, err := x509.ParsePKCS8PrivateKey(block.Bytes); err != nil {
+				return nil, fmt.Errorf("PRIVATE KEY block is not PKCS#8: %w", err)
+			}
+			keyPEM = pem.EncodeToMemory(block)
 		default:
 			return nil, fmt.Errorf("unknown PEM block type %q", block.Type)
 		}
 	}
-
-	if leafKeyBytes == nil {
-		return nil, fmt.Errorf("no PRIVATE KEY block found")
+	if len(bytes.TrimSpace(bundleBytes)) != 0 {
+		return nil, fmt.Errorf("credential bundle contains malformed non-PEM data")
 	}
 
-	if len(chainBytes) == 0 {
+	if keyPEM == nil {
+		return nil, fmt.Errorf("no PRIVATE KEY block found")
+	}
+	if len(certPEM) == 0 {
 		return nil, fmt.Errorf("no CERTIFICATE blocks found")
 	}
 
-	leafKey, err := x509.ParsePKCS8PrivateKey(leafKeyBytes)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("while parsing private key: %w", err)
+		return nil, fmt.Errorf("invalid certificate and private key pair: %w", err)
 	}
-
-	leafCert, err := x509.ParseCertificate(chainBytes[0])
-	if err != nil {
-		return nil, fmt.Errorf("while parsing leaf certificate: %w", err)
+	parsedChain := make([]*x509.Certificate, len(cert.Certificate))
+	for i, der := range cert.Certificate {
+		parsed, err := x509.ParseCertificate(der)
+		if err != nil {
+			return nil, fmt.Errorf("while parsing certificate %d: %w", i, err)
+		}
+		parsedChain[i] = parsed
+		if i == 0 {
+			cert.Leaf = parsed
+			continue
+		}
+		if !parsed.BasicConstraintsValid || !parsed.IsCA {
+			return nil, fmt.Errorf("certificate %d in serving chain is not a certificate authority", i)
+		}
 	}
-
-	return &tls.Certificate{
-		Certificate: chainBytes,
-		Leaf:        leafCert,
-		PrivateKey:  leafKey,
-	}, nil
+	for i := 0; i+1 < len(parsedChain); i++ {
+		if err := parsedChain[i].CheckSignatureFrom(parsedChain[i+1]); err != nil {
+			return nil, fmt.Errorf("certificate %d is not signed by certificate %d: %w", i, i+1, err)
+		}
+	}
+	return &cert, nil
 }
 
-// ParsePool reads a PEM trust bundle into a pool. A file with no certificates
-// is an error, since an empty pool would silently reject every peer.
+// ParsePool reads a strict PEM trust bundle into a pool. Every block must be
+// a parseable CA certificate; a partially valid bundle is rejected.
 func ParsePool(path string) (*x509.CertPool, error) {
+	pool, _, err := ParseTrustBundle(path)
+	return pool, err
+}
+
+// ParseTrustBundle returns both the trust pool and parsed certificates so
+// readiness can validate the current certificates' validity windows.
+func ParseTrustBundle(path string) (*x509.CertPool, []*x509.Certificate, error) {
 	pemBytes, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("while reading trust bundle: %w", err)
+		return nil, nil, fmt.Errorf("while reading trust bundle: %w", err)
 	}
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("trust bundle %q contains no certificates", path)
+	var certificates []*x509.Certificate
+	for len(bytes.TrimSpace(pemBytes)) != 0 {
+		pemBytes = bytes.TrimSpace(pemBytes)
+		if !bytes.HasPrefix(pemBytes, []byte("-----BEGIN ")) {
+			return nil, nil, fmt.Errorf("trust bundle %q contains malformed non-PEM data", path)
+		}
+		block, rest := pem.Decode(pemBytes)
+		if block == nil {
+			return nil, nil, fmt.Errorf("trust bundle %q contains malformed non-PEM data", path)
+		}
+		pemBytes = rest
+		if block.Type != "CERTIFICATE" {
+			return nil, nil, fmt.Errorf("trust bundle %q contains PEM block type %q", path, block.Type)
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parsing certificate in trust bundle %q: %w", path, err)
+		}
+		if !certificate.BasicConstraintsValid || !certificate.IsCA {
+			return nil, nil, fmt.Errorf("trust bundle %q contains a certificate that is not a certificate authority", path)
+		}
+		pool.AddCert(certificate)
+		certificates = append(certificates, certificate)
 	}
-	return pool, nil
+	if len(certificates) == 0 {
+		return nil, nil, fmt.Errorf("trust bundle %q contains no certificates", path)
+	}
+	return pool, certificates, nil
 }

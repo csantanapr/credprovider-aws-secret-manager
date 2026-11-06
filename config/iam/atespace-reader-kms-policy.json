@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DecryptOnlyThisAtespacesSecretsThroughSecretsManager",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:REPLACE_WITH_AWS_PARTITION:kms:REPLACE_WITH_AWS_REGION:REPLACE_WITH_AWS_ACCOUNT_ID:key/REPLACE_WITH_KMS_KEY_ID",
+      "Condition": {
+        "StringEquals": {"kms:ViaService": "secretsmanager.REPLACE_WITH_AWS_REGION.REPLACE_WITH_AWS_DNS_SUFFIX"},
+        "StringLike": {
+          "kms:EncryptionContext:SecretARN": "arn:REPLACE_WITH_AWS_PARTITION:secretsmanager:REPLACE_WITH_AWS_REGION:REPLACE_WITH_AWS_ACCOUNT_ID:secret:ate/${aws:PrincipalTag/ate-atespace}/*"
+        }
+      }
+    }
+  ]
+}

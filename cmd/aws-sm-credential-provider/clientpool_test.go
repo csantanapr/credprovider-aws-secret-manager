@@ -31,17 +31,33 @@ const readerRole = "arn:aws:iam::111122223333:role/ate-secrets-reader"
 
 // fakeSTS records each AssumeRole call and answers with short-lived keys.
 type fakeSTS struct {
-	mu    sync.Mutex
-	calls []*sts.AssumeRoleInput
+	mu          sync.Mutex
+	calls       []*sts.AssumeRoleInput
+	expirations []time.Time
+	block       bool
+	expiration  time.Duration
 }
 
-func (f *fakeSTS) AssumeRole(_ context.Context, in *sts.AssumeRoleInput, _ ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+func (f *fakeSTS) AssumeRole(ctx context.Context, in *sts.AssumeRoleInput, _ ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, in)
+	block := f.block
+	expiration := f.expiration
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if expiration == 0 {
+		expiration = time.Hour
+	}
+	expires := time.Now().Add(expiration)
+	f.mu.Lock()
+	f.expirations = append(f.expirations, expires)
+	f.mu.Unlock()
 	return &sts.AssumeRoleOutput{Credentials: &ststypes.Credentials{
 		AccessKeyId: aws.String("AKIDEXAMPLE"), SecretAccessKey: aws.String("example"),
-		SessionToken: aws.String("example"), Expiration: aws.Time(time.Now().Add(time.Hour)),
+		SessionToken: aws.String("example"), Expiration: aws.Time(expires),
 	}}, nil
 }
 
@@ -117,5 +133,58 @@ func TestClientPoolPerAtespaceRole(t *testing.T) {
 		if got := aws.ToString(in.RoleSessionName); got != want[atespace] {
 			t.Errorf("RoleSessionName for %q = %q, want %q", atespace, got, want[atespace])
 		}
+	}
+}
+
+func TestPerAtespaceAssumeRoleHasOperationDeadline(t *testing.T) {
+	fake := &fakeSTS{block: true}
+	p := &clientPool{
+		base:                     baseConfig(),
+		atespaceRoleARN:          readerRole,
+		sts:                      fake,
+		credentialRefreshTimeout: 25 * time.Millisecond,
+	}
+	client, err := p.client("team-a", "us-west-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := client.Options().Credentials.Retrieve(context.Background()); err == nil {
+		t.Fatal("stalled AssumeRole returned no error")
+	}
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("AssumeRole refresh lasted %v, want about 25ms", elapsed)
+	}
+}
+
+func TestPerAtespaceCredentialsRefreshBeforeExpiration(t *testing.T) {
+	fake := &fakeSTS{expiration: 2 * time.Minute}
+	p := &clientPool{base: baseConfig(), atespaceRoleARN: readerRole, sts: fake}
+	client, err := p.client("team-a", "us-west-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := client.Options().Credentials.Retrieve(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	firstActualExpiry := fake.expirations[0]
+	fake.mu.Unlock()
+	advance := firstActualExpiry.Sub(first.Expires)
+	if advance < 5*time.Minute/2 || advance > 5*time.Minute {
+		t.Fatalf("effective expiry advanced by %v, want 2m30s to 5m", advance)
+	}
+	if !firstActualExpiry.After(time.Now()) {
+		t.Fatal("test credentials were already actually expired")
+	}
+	if _, err := client.Options().Credentials.Retrieve(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	calls := len(fake.calls)
+	fake.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("AssumeRole calls = %d, want a refresh while the first credentials remain valid", calls)
 	}
 }

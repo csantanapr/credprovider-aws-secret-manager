@@ -75,7 +75,14 @@ func (f *fakeSM) GetSecretValue(ctx context.Context, in *secretsmanager.GetSecre
 		return nil, err
 	}
 	if o := f.out[id]; o != nil {
-		return o, nil
+		copy := *o
+		if copy.VersionId == nil && in.VersionId != nil {
+			copy.VersionId = aws.String(aws.ToString(in.VersionId))
+		}
+		if len(copy.VersionStages) == 0 && in.VersionStage != nil {
+			copy.VersionStages = []string{aws.ToString(in.VersionStage)}
+		}
+		return &copy, nil
 	}
 	return nil, &smithy.GenericAPIError{Code: "ResourceNotFoundException", Message: "Secrets Manager can't find the specified secret."}
 }
@@ -118,12 +125,16 @@ func uri(account, name, tail string) string {
 
 func defaultSM() *fakeSM {
 	return &fakeSM{out: map[string]*secretsmanager.GetSecretValueOutput{
-		"ate/team-a/github": {ARN: arn(acct, "ate/team-a/github"), SecretString: aws.String(`{"token":"ghp_example","n":1}`)},
-		"ate/team-a/raw":    {ARN: arn(acct, "ate/team-a/raw"), SecretString: aws.String("plain-token")},
-		"ate/team-a/bin":    {ARN: arn(acct, "ate/team-a/bin"), SecretBinary: []byte{0x01, 0x02}},
-		"arn:aws:secretsmanager:us-west-2:" + otherAcc + ":secret:shared/github": {ARN: arn(otherAcc, "shared/github"), SecretString: aws.String("x-acct")},
+		"ate/team-a/github": {Name: aws.String("ate/team-a/github"), ARN: arn(acct, "ate/team-a/github"), SecretString: aws.String(`{"token":"ghp_example","n":1}`)},
+		"ate/team-a/raw":    {Name: aws.String("ate/team-a/raw"), ARN: arn(acct, "ate/team-a/raw"), SecretString: aws.String("plain-token")},
+		"ate/team-a/bin":    {Name: aws.String("ate/team-a/bin"), ARN: arn(acct, "ate/team-a/bin"), SecretBinary: []byte{0x01, 0x02}},
+		"arn:aws:secretsmanager:us-west-2:" + otherAcc + ":secret:shared/github": {Name: aws.String("shared/github"), ARN: arn(otherAcc, "shared/github"), SecretString: aws.String("x-acct")},
 		// A name that Secrets Manager resolved to some other secret.
-		"ate/team-a/confused": {ARN: arn(acct, "ate/team-a/other"), SecretString: aws.String("wrong")},
+		"ate/team-a/confused": {Name: aws.String("ate/team-a/other"), ARN: arn(acct, "ate/team-a/other"), SecretString: aws.String("wrong")},
+		// A sibling whose ARN shares the requested secret's old prefix check.
+		"ate/team-a/foo":           {Name: aws.String("ate/team-a/foo-extra"), ARN: arn(acct, "ate/team-a/foo-extra"), SecretString: aws.String("wrong")},
+		"ate/team-a/wrong-stage":   {Name: aws.String("ate/team-a/wrong-stage"), ARN: arn(acct, "ate/team-a/wrong-stage"), VersionStages: []string{"AWSPREVIOUS"}, SecretString: aws.String("wrong")},
+		"ate/team-a/wrong-version": {Name: aws.String("ate/team-a/wrong-version"), ARN: arn(acct, "ate/team-a/wrong-version"), VersionId: aws.String("aaaaaaaa-1111-2222-3333-444455556666"), SecretString: aws.String("wrong")},
 	}, err: map[string]error{
 		"ate/team-a/throttled": &smithy.GenericAPIError{Code: "ThrottlingException", Message: "Rate exceeded"},
 		"ate/team-a/denied":    &smithy.GenericAPIError{Code: "AccessDeniedException", Message: "not authorized"},
@@ -162,6 +173,9 @@ func TestFetchSecret(t *testing.T) {
 		{"scheduled for deletion", uri(acct, "ate/team-a/deleting", "/stages/AWSCURRENT"), actorA, "", codes.FailedPrecondition},
 		{"credentials unavailable", uri(acct, "ate/team-a/agentdown", "/stages/AWSCURRENT"), actorA, "", codes.Unavailable},
 		{"resolved to other secret", uri(acct, "ate/team-a/confused", "/stages/AWSCURRENT"), actorA, "", codes.PermissionDenied},
+		{"prefix-colliding sibling denied", uri(acct, "ate/team-a/foo", "/stages/AWSCURRENT"), actorA, "", codes.PermissionDenied},
+		{"wrong stage denied", uri(acct, "ate/team-a/wrong-stage", "/stages/AWSCURRENT"), actorA, "", codes.PermissionDenied},
+		{"wrong version denied", uri(acct, "ate/team-a/wrong-version", "/versions/0d0a8f6e-1111-2222-3333-444455556666"), actorA, "", codes.PermissionDenied},
 		{"reader role denied", uri(acct, "ate/team-a/reader-denied", "/stages/AWSCURRENT"), actorA, "", codes.PermissionDenied},
 	}
 	for _, tc := range cases {
@@ -175,7 +189,7 @@ func TestFetchSecret(t *testing.T) {
 			if tc.code == codes.OK && string(resp.GetOpaqueBytes()) != tc.want {
 				t.Fatalf("value = %q, want %q", resp.GetOpaqueBytes(), tc.want)
 			}
-			if (tc.code == codes.PermissionDenied && tc.name != "iam denied" && tc.name != "kms denied" && tc.name != "resolved to other secret" && tc.name != "reader role denied") || tc.code == codes.InvalidArgument {
+			if (tc.code == codes.PermissionDenied && tc.name != "iam denied" && tc.name != "kms denied" && tc.name != "resolved to other secret" && tc.name != "prefix-colliding sibling denied" && tc.name != "wrong stage denied" && tc.name != "wrong version denied" && tc.name != "reader role denied") || tc.code == codes.InvalidArgument {
 				if n := sm.calls.Load(); n != 0 {
 					t.Fatalf("denied before Secrets Manager, but it was called %d times", n)
 				}
@@ -403,7 +417,7 @@ func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	get := func(name string) {
 		t.Helper()
 		k := keyFor("", SecretRef{Account: acct, Region: "us-west-2", Name: name, Stage: "AWSCURRENT"})
-		v, err := c.Get(context.Background(), k, func(context.Context) ([]byte, error) {
+		v, err := c.Get(context.Background(), "team-a", k, func(context.Context) ([]byte, error) {
 			calls[name]++
 			return []byte("v-" + name), nil
 		})
@@ -422,5 +436,140 @@ func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	get("b")
 	if calls["a"] != 1 || calls["b"] != 2 || calls["c"] != 1 {
 		t.Fatalf("fetches = %v, want a:1 b:2 c:1", calls)
+	}
+}
+
+func TestCacheBoundsPayloadBytes(t *testing.T) {
+	c := NewCache(CacheConfig{StageTTL: time.Minute, MaxEntries: 10, MaxBytes: 5}, time.Second)
+	calls := map[string]int{}
+	get := func(name, value string) {
+		t.Helper()
+		k := keyFor("", SecretRef{Account: acct, Region: "us-west-2", Name: name, Stage: "AWSCURRENT"})
+		got, err := c.Get(context.Background(), "team-a", k, func(context.Context) ([]byte, error) {
+			calls[name]++
+			return []byte(value), nil
+		})
+		if err != nil || string(got) != value {
+			t.Fatalf("Get(%s) = %q, %v", name, got, err)
+		}
+	}
+
+	get("a", "1234")
+	get("b", "5678") // evicts a to stay under five bytes
+	if got := c.Bytes(); got != 4 {
+		t.Fatalf("Bytes = %d, want 4", got)
+	}
+	get("a", "1234")
+	if calls["a"] != 2 {
+		t.Fatalf("a fetched %d times, want 2 after byte eviction", calls["a"])
+	}
+	get("oversize", "123456")
+	get("oversize", "123456")
+	if calls["oversize"] != 2 {
+		t.Fatalf("oversize value fetched %d times, want it never cached", calls["oversize"])
+	}
+	if got := c.Bytes(); got > 5 {
+		t.Fatalf("Bytes = %d, exceeds configured maximum", got)
+	}
+}
+
+func TestCacheWaitsForPerScopeSlotWithoutBlockingOtherAtespaces(t *testing.T) {
+	c := NewCache(CacheConfig{
+		MaxEntries:          10,
+		MaxBytes:            1024,
+		MaxInflight:         2,
+		MaxInflightPerScope: 1,
+	}, time.Second)
+	entered := make(chan string, 3)
+	releaseA := make(chan struct{})
+	releaseB := make(chan struct{})
+	start := func(scope, name string, release <-chan struct{}) <-chan error {
+		result := make(chan error, 1)
+		k := keyFor("", SecretRef{Account: acct, Region: "us-west-2", Name: name, Stage: "AWSCURRENT"})
+		go func() {
+			_, err := c.Get(context.Background(), scope, k, func(context.Context) ([]byte, error) {
+				entered <- name
+				if release != nil {
+					<-release
+				}
+				return []byte("value"), nil
+			})
+			result <- err
+		}()
+		return result
+	}
+
+	firstA := start("team-a", "a1", releaseA)
+	if got := <-entered; got != "a1" {
+		t.Fatalf("first fetch = %q", got)
+	}
+	secondA := start("team-a", "a2", nil)
+	select {
+	case got := <-entered:
+		t.Fatalf("same-scope fetch %q started before a slot was released", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	teamB := start("team-b", "b", releaseB)
+	if got := <-entered; got != "b" {
+		t.Fatalf("other-scope fetch = %q, want b", got)
+	}
+	close(releaseB)
+	if err := <-teamB; err != nil {
+		t.Fatal(err)
+	}
+
+	close(releaseA)
+	if err := <-firstA; err != nil {
+		t.Fatal(err)
+	}
+	if got := <-entered; got != "a2" {
+		t.Fatalf("waiting same-scope fetch = %q, want a2", got)
+	}
+	if err := <-secondA; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCacheAdmissionWaitIsBounded(t *testing.T) {
+	c := NewCache(CacheConfig{MaxInflight: 1, MaxInflightPerScope: 1}, 25*time.Millisecond)
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	firstKey := keyFor("", SecretRef{Account: acct, Region: "us-west-2", Name: "a", Stage: "AWSCURRENT"})
+	first := make(chan error, 1)
+	go func() {
+		_, err := c.Get(context.Background(), "team-a", firstKey, func(context.Context) ([]byte, error) {
+			close(entered)
+			<-release
+			return []byte("value"), nil
+		})
+		first <- err
+	}()
+	<-entered
+
+	secondKey := keyFor("", SecretRef{Account: acct, Region: "us-west-2", Name: "b", Stage: "AWSCURRENT"})
+	start := time.Now()
+	_, err := c.Get(context.Background(), "team-b", secondKey, func(context.Context) ([]byte, error) { return nil, nil })
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("admission wait = %v, want Unavailable", err)
+	}
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("admission wait lasted %v, want about 25ms", elapsed)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAccessErrorDoesNotReturnAWSMessage(t *testing.T) {
+	awsMessage := "User arn:aws:sts::111122223333:assumed-role/provider/session is not authorized"
+	err := accessError(SecretRef{Account: acct, Region: "us-west-2", Name: "ate/team-a/x", Stage: "AWSCURRENT"},
+		&smithy.GenericAPIError{Code: "AccessDeniedException", Message: awsMessage})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied", status.Code(err))
+	}
+	if strings.Contains(err.Error(), awsMessage) || strings.Contains(err.Error(), "assumed-role/provider/session") {
+		t.Fatalf("gRPC error exposes the upstream AWS message: %v", err)
 	}
 }

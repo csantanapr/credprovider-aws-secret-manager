@@ -5,7 +5,10 @@
       "Sid": "ChainIntoTheAtespaceReader",
       "Effect": "Allow",
       "Action": ["sts:AssumeRole", "sts:TagSession"],
-      "Resource": "arn:aws:iam::111122223333:role/ate-secrets-reader"
+      "Resource": "arn:REPLACE_WITH_AWS_PARTITION:iam::REPLACE_WITH_AWS_ACCOUNT_ID:role/ate-secrets-reader",
+      "Condition": {
+        "Null": {"aws:RequestTag/ate-atespace": "false"}
+      }
     }
   ]
 }

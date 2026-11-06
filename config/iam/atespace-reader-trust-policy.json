@@ -4,10 +4,11 @@
     {
       "Sid": "OnlyTheProviderWithAnAtespaceTag",
       "Effect": "Allow",
-      "Principal": {"AWS": "arn:aws:iam::111122223333:role/aws-sm-credential-provider"},
+      "Principal": {"AWS": "arn:REPLACE_WITH_AWS_PARTITION:iam::REPLACE_WITH_AWS_ACCOUNT_ID:role/aws-sm-credential-provider"},
       "Action": ["sts:AssumeRole", "sts:TagSession"],
       "Condition": {
-        "StringLike": {"aws:RequestTag/ate-atespace": "?*"}
+        "StringLike": {"aws:RequestTag/ate-atespace": "?*"},
+        "Null": {"aws:RequestTag/ate-atespace": "false"}
       }
     }
   ]

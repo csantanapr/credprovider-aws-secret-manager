@@ -63,8 +63,9 @@ func TestVerifyCallerSAN(t *testing.T) {
 			state: tls.ConnectionState{PeerCertificates: []*x509.Certificate{certWithURIs(t, testCaller)}},
 		},
 		{
-			name:  "matching SAN among several",
-			state: tls.ConnectionState{PeerCertificates: []*x509.Certificate{certWithURIs(t, "spiffe://cluster.local/ns/other/sa/x", testCaller)}},
+			name:    "matching SAN among several is rejected",
+			state:   tls.ConnectionState{PeerCertificates: []*x509.Certificate{certWithURIs(t, "spiffe://cluster.local/ns/other/sa/x", testCaller)}},
+			wantErr: true,
 		},
 		{
 			name:    "wrong SAN",
@@ -111,6 +112,7 @@ func TestServerCredentialsRequiresConfig(t *testing.T) {
 		{name: "no server bundle", mutate: func(c *Config) { c.ServerBundle = "" }},
 		{name: "no client CA file", mutate: func(c *Config) { c.ClientCAFile = "" }},
 		{name: "no caller identity", mutate: func(c *Config) { c.CallerIdentity = "" }},
+		{name: "malformed caller identity", mutate: func(c *Config) { c.CallerIdentity = "https://example.com/caller" }},
 		{name: "client CA file missing", mutate: func(c *Config) { c.ClientCAFile = absent }, wantIs: fs.ErrNotExist},
 		{name: "server bundle missing", mutate: func(c *Config) { c.ServerBundle = absent }, wantIs: fs.ErrNotExist},
 	}
@@ -167,7 +169,7 @@ func TestServerCredentialsReloadsClientCA(t *testing.T) {
 		t.Fatalf("handshake with CA2-signed client cert before rotation: err = %v, want an unknown-authority failure", err)
 	}
 	// A valid chain with the wrong SAN is rejected.
-	if err := handshake(t, creds, serverRoots, wrongSAN); err == nil || !strings.Contains(err.Error(), "do not include the expected caller identity") {
+	if err := handshake(t, creds, serverRoots, wrongSAN); err == nil || !strings.Contains(err.Error(), "exactly the expected caller URI SAN") {
 		t.Fatalf("handshake with wrong-SAN client cert: err = %v, want the caller identity check to refuse it", err)
 	}
 
@@ -305,6 +307,11 @@ type ca struct {
 
 func newCA(t *testing.T, cn string) *ca {
 	t.Helper()
+	return newCAWithValidity(t, cn, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+}
+
+func newCAWithValidity(t *testing.T, cn string, notBefore, notAfter time.Time) *ca {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate CA key: %v", err)
@@ -312,8 +319,8 @@ func newCA(t *testing.T, cn string) *ca {
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: cn},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -330,8 +337,10 @@ func newCA(t *testing.T, cn string) *ca {
 }
 
 type certOpts struct {
-	dnsNames []string
-	uris     []string
+	dnsNames  []string
+	uris      []string
+	notBefore time.Time
+	notAfter  time.Time
 }
 
 // issued is a leaf certificate and its private key.
@@ -354,11 +363,18 @@ func (c *ca) issue(t *testing.T, opts certOpts) issued {
 		}
 		uris = append(uris, parsed)
 	}
+	notBefore, notAfter := opts.notBefore, opts.notAfter
+	if notBefore.IsZero() {
+		notBefore = time.Now().Add(-time.Hour)
+	}
+	if notAfter.IsZero() {
+		notAfter = time.Now().Add(time.Hour)
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      pkix.Name{CommonName: "leaf"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		DNSNames:     opts.dnsNames,
@@ -396,5 +412,48 @@ func writeFileWithMtime(t *testing.T, path string, data []byte, mtime time.Time)
 	}
 	if err := os.Chtimes(path, mtime, mtime); err != nil {
 		t.Fatalf("chtimes %s: %v", path, err)
+	}
+}
+
+func TestHealthCheckFollowsCredentialRotation(t *testing.T) {
+	serverBundle := writeCredBundle(t, newCA(t, "server-ca").issue(t, certOpts{dnsNames: []string{"credprovider.test"}}))
+	clientCAFile := filepath.Join(t.TempDir(), "client-ca.pem")
+	writeFileWithMtime(t, clientCAFile, newCA(t, "client-ca").certPEM, time.Now())
+	check := HealthCheck(Config{ServerBundle: serverBundle, ClientCAFile: clientCAFile, CallerIdentity: testCaller})
+	if err := check(); err != nil {
+		t.Fatalf("HealthCheck(valid) = %v", err)
+	}
+	if err := os.WriteFile(serverBundle, []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(serverBundle, time.Now().Add(time.Second), time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := check(); err == nil {
+		t.Fatal("HealthCheck accepted a broken rotated server bundle")
+	}
+
+	for _, tc := range []struct {
+		name string
+		opts certOpts
+	}{
+		{name: "expired", opts: certOpts{dnsNames: []string{"credprovider.test"}, notBefore: time.Now().Add(-2 * time.Hour), notAfter: time.Now().Add(-time.Hour)}},
+		{name: "not yet valid", opts: certOpts{dnsNames: []string{"credprovider.test"}, notBefore: time.Now().Add(time.Hour), notAfter: time.Now().Add(2 * time.Hour)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle := writeCredBundle(t, newCA(t, "validity-ca").issue(t, tc.opts))
+			validityCheck := HealthCheck(Config{ServerBundle: bundle, ClientCAFile: clientCAFile, CallerIdentity: testCaller})
+			if err := validityCheck(); err == nil {
+				t.Fatalf("HealthCheck accepted a %s certificate", tc.name)
+			}
+		})
+	}
+
+	expiredClientCA := newCAWithValidity(t, "expired-client-ca", time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+	expiredClientCAFile := filepath.Join(t.TempDir(), "expired-client-ca.pem")
+	writeFileWithMtime(t, expiredClientCAFile, expiredClientCA.certPEM, time.Now())
+	validServerBundle := writeCredBundle(t, newCA(t, "server-ca").issue(t, certOpts{dnsNames: []string{"credprovider.test"}}))
+	if err := HealthCheck(Config{ServerBundle: validServerBundle, ClientCAFile: expiredClientCAFile, CallerIdentity: testCaller})(); err == nil {
+		t.Fatal("HealthCheck accepted an expired client CA")
 	}
 }

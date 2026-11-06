@@ -14,7 +14,10 @@
 
 package provider
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const base = "ate-secret://secretsmanager.amazonaws.com/accounts/111122223333/regions/us-west-2/secrets/"
 
@@ -38,6 +41,8 @@ func TestParseURI(t *testing.T) {
 			SecretRef{Account: "111122223333", Region: "us-west-2", Name: "name+with=odd.chars@x-1", Stage: "custom_label"}},
 		{"ate-secret://secretsmanager.amazonaws.com/accounts/111122223333/regions/us-gov-west-1/secrets/x/stages/AWSCURRENT",
 			SecretRef{Account: "111122223333", Region: "us-gov-west-1", Name: "x", Stage: "AWSCURRENT"}},
+		{"ate-secret://secretsmanager.amazonaws.com/accounts/111122223333/regions/eusc-de-east-1/secrets/x/stages/AWSCURRENT",
+			SecretRef{Account: "111122223333", Region: "eusc-de-east-1", Name: "x", Stage: "AWSCURRENT"}},
 	}
 	for _, tc := range good {
 		got, err := ParseURI(tc.uri)
@@ -82,8 +87,31 @@ func TestARNs(t *testing.T) {
 	if got, want := ref.PartialARN(), "arn:aws:secretsmanager:us-west-2:111122223333:secret:ate/team-a/github"; got != want {
 		t.Errorf("PartialARN = %q, want %q", got, want)
 	}
-	cn := SecretRef{Account: "111122223333", Region: "cn-north-1", Name: "x"}
-	if got := cn.Partition(); got != "aws-cn" {
-		t.Errorf("Partition(cn-north-1) = %q", got)
+	for region, want := range map[string]string{
+		"cn-north-1":      "aws-cn",
+		"eusc-de-east-1":  "aws-eusc",
+		"eu-isoe-west-1":  "aws-iso-e",
+		"us-isof-south-1": "aws-iso-f",
+	} {
+		ref := SecretRef{Account: "111122223333", Region: region, Name: "x"}
+		if got := ref.Partition(); got != want {
+			t.Errorf("Partition(%s) = %q, want %q", region, got, want)
+		}
+	}
+}
+
+func TestParseURIErrorsDoNotEchoInput(t *testing.T) {
+	for _, raw := range []string{
+		"ate-secret://token-marker@secretsmanager.amazonaws.com/accounts/111122223333/regions/us-west-2/secrets/x/stages/AWSCURRENT",
+		base + "x/stages/AWSCURRENT?token-marker",
+		base + "x/stages/AWSCURRENT#token-marker",
+	} {
+		_, err := ParseURI(raw)
+		if err == nil {
+			t.Fatalf("ParseURI(%q) succeeded", raw)
+		}
+		if strings.Contains(err.Error(), "token-marker") || strings.Contains(err.Error(), raw) {
+			t.Fatalf("ParseURI error echoed sensitive input: %v", err)
+		}
 	}
 }

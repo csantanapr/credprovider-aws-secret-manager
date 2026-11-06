@@ -5,9 +5,12 @@
       "Sid": "DecryptOnlyThroughSecretsManager",
       "Effect": "Allow",
       "Action": "kms:Decrypt",
-      "Resource": "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+      "Resource": "arn:REPLACE_WITH_AWS_PARTITION:kms:REPLACE_WITH_AWS_REGION:REPLACE_WITH_AWS_ACCOUNT_ID:key/REPLACE_WITH_KMS_KEY_ID",
       "Condition": {
-        "StringEquals": {"kms:ViaService": "secretsmanager.us-west-2.amazonaws.com"}
+        "StringEquals": {"kms:ViaService": "secretsmanager.REPLACE_WITH_AWS_REGION.REPLACE_WITH_AWS_DNS_SUFFIX"},
+        "StringLike": {
+          "kms:EncryptionContext:SecretARN": "arn:REPLACE_WITH_AWS_PARTITION:secretsmanager:REPLACE_WITH_AWS_REGION:REPLACE_WITH_AWS_ACCOUNT_ID:secret:ate/*"
+        }
       }
     }
   ]

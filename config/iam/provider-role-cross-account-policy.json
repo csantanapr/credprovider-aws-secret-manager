@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadExplicitRemoteSecretPrefix",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:REPLACE_WITH_REMOTE_AWS_PARTITION:secretsmanager:REPLACE_WITH_REMOTE_AWS_REGION:REPLACE_WITH_REMOTE_AWS_ACCOUNT_ID:secret:REPLACE_WITH_REMOTE_SECRET_PREFIX*",
+      "Condition": {
+        "StringEquals": {"aws:ResourceTag/ate.dev/injectable": "true"}
+      }
+    },
+    {
+      "Sid": "DecryptExplicitRemoteKeyThroughSecretsManager",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:REPLACE_WITH_REMOTE_AWS_PARTITION:kms:REPLACE_WITH_REMOTE_AWS_REGION:REPLACE_WITH_REMOTE_AWS_ACCOUNT_ID:key/REPLACE_WITH_REMOTE_KMS_KEY_ID",
+      "Condition": {
+        "StringEquals": {"kms:ViaService": "secretsmanager.REPLACE_WITH_REMOTE_AWS_REGION.REPLACE_WITH_REMOTE_AWS_DNS_SUFFIX"},
+        "StringLike": {
+          "kms:EncryptionContext:SecretARN": "arn:REPLACE_WITH_REMOTE_AWS_PARTITION:secretsmanager:REPLACE_WITH_REMOTE_AWS_REGION:REPLACE_WITH_REMOTE_AWS_ACCOUNT_ID:secret:REPLACE_WITH_REMOTE_SECRET_PREFIX*"
+        }
+      }
+    }
+  ]
+}

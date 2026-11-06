@@ -17,6 +17,7 @@ package main
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
@@ -41,6 +42,9 @@ type clientPool struct {
 	atespaceRoleARN string
 	// sts assumes atespaceRoleARN; an STS client in the provider's own region.
 	sts stscreds.AssumeRoleAPIClient
+	// credentialRefreshTimeout bounds the entire AssumeRole operation,
+	// including retries. Zero selects the production default.
+	credentialRefreshTimeout time.Duration
 
 	mu      sync.Mutex
 	clients map[[2]string]*secretsmanager.Client
@@ -71,13 +75,20 @@ func (p *clientPool) client(atespace, region string) (*secretsmanager.Client, er
 	if p.atespaceRoleARN != "" {
 		cc, ok := p.creds[atespace]
 		if !ok {
-			// Chained sessions last at most one hour; the cache renews them
-			// before they expire.
-			cc = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(p.sts, p.atespaceRoleARN,
+			timeout := p.credentialRefreshTimeout
+			if timeout <= 0 {
+				timeout = defaultCredentialRefreshLimit
+			}
+			assume := stscreds.NewAssumeRoleProvider(p.sts, p.atespaceRoleARN,
 				func(o *stscreds.AssumeRoleOptions) {
 					o.RoleSessionName = sessionName(atespace)
 					o.Tags = []ststypes.Tag{{Key: aws.String(atespaceTagKey), Value: aws.String(atespace)}}
-				}))
+				})
+			cc = aws.NewCredentialsCache(timeoutCredentialsProvider{provider: assume, timeout: timeout},
+				func(o *aws.CredentialsCacheOptions) {
+					o.ExpiryWindow = defaultCredentialExpiryWindow
+					o.ExpiryWindowJitterFrac = 0.5
+				})
 			if p.creds == nil {
 				p.creds = map[string]*aws.CredentialsCache{}
 			}

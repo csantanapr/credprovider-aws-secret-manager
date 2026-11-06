@@ -31,6 +31,10 @@ spec:
         app: aws-sm-credential-provider
     spec:
       serviceAccountName: aws-sm-credential-provider
+      # The provider does not call the Kubernetes API. EKS Pod Identity injects
+      # its own projected token independently of the API bearer token.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
       securityContext:
         runAsUser: 65532
         runAsGroup: 65532
@@ -62,14 +66,27 @@ spec:
         # The cluster's Region, for STS. The provider refuses to start until
         # this is a real Region name.
         - "--region=REPLACE_WITH_AWS_REGION"
+        # Pin startup to the role associated with this ServiceAccount. Replace
+        # the partition (aws, aws-us-gov, aws-cn, ...), account, and role path.
+        - "--expected-role-arn=arn:REPLACE_WITH_AWS_PARTITION:iam::REPLACE_WITH_AWS_ACCOUNT_ID:role/aws-sm-credential-provider"
         # Under the egress gateway's 4s budget for all of a request's injections.
         - "--fetch-timeout=2s"
         # After a rotation the old value is injected for up to this long.
         - "--cache-ttl=30s"
+        # Bound both retained payloads and distinct reads. Per-atespace
+        # admission prevents one tenant from consuming the global allowance.
+        - "--cache-max-bytes=67108864"
+        - "--fetch-concurrency=64"
+        - "--atespace-fetch-concurrency=8"
+        - "--rpc-concurrency=128"
+        - "--grpc-connection-limit=16"
+        # Reauthenticate long-lived HTTP/2 clients after certificate rotation.
+        - "--max-connection-age=5m"
+        - "--max-connection-age-grace=30s"
         - "--log-level=info"
         # Optional: IAM also enforces atespace isolation, and CloudTrail names
         # the atespace (README, Per-atespace IAM).
-        # - "--atespace-role-arn=arn:aws:iam::111122223333:role/ate-secrets-reader"
+        # - "--atespace-role-arn=arn:REPLACE_WITH_AWS_PARTITION:iam::REPLACE_WITH_AWS_ACCOUNT_ID:role/ate-secrets-reader"
         ports:
         - name: grpc
           containerPort: 50051

@@ -20,8 +20,11 @@ package mtls
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net/url"
+	"time"
 
 	"google.golang.org/grpc/credentials"
 
@@ -50,6 +53,8 @@ func ServerCredentials(cfg Config) (credentials.TransportCredentials, error) {
 		return nil, errors.New("a client trust bundle is required")
 	case cfg.CallerIdentity == "":
 		return nil, errors.New("a caller identity is required")
+	case !validSPIFFEID(cfg.CallerIdentity):
+		return nil, fmt.Errorf("caller identity %q is not a canonical SPIFFE ID", cfg.CallerIdentity)
 	}
 
 	loadPool := credbundle.PoolLoader(cfg.ClientCAFile)
@@ -80,19 +85,56 @@ func ServerCredentials(cfg Config) (credentials.TransportCredentials, error) {
 	}), nil
 }
 
-// verifyCallerSAN returns a VerifyConnection callback requiring expectedSAN
-// among the caller certificate's URI SANs.
+// verifyCallerSAN returns a VerifyConnection callback requiring exactly the
+// expected URI SAN. A SPIFFE X.509-SVID contains exactly one URI SAN.
 func verifyCallerSAN(expectedSAN string) func(tls.ConnectionState) error {
 	return func(state tls.ConnectionState) error {
 		if len(state.PeerCertificates) == 0 {
 			return errors.New("client certificate is required")
 		}
 		leaf := state.PeerCertificates[0]
-		for _, u := range leaf.URIs {
-			if u.String() == expectedSAN {
-				return nil
+		if len(leaf.URIs) != 1 || leaf.URIs[0].String() != expectedSAN {
+			return fmt.Errorf("client certificate must carry exactly the expected caller URI SAN %q", expectedSAN)
+		}
+		return nil
+	}
+}
+
+func validSPIFFEID(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "spiffe" && u.Host != "" && u.User == nil &&
+		u.RawQuery == "" && u.Fragment == "" && u.Path != "" && u.EscapedPath() == u.Path && u.String() == raw
+}
+
+// HealthCheck returns a readiness dependency that follows certificate and
+// trust-bundle rotations and rejects malformed, non-CA, expired, or
+// not-yet-valid certificates.
+func HealthCheck(cfg Config) func() error {
+	serverCert := credbundle.Loader(cfg.ServerBundle)
+	return func() error {
+		cert, err := serverCert(nil)
+		if err != nil {
+			return fmt.Errorf("server credential bundle: %w", err)
+		}
+		now := time.Now()
+		for i, der := range cert.Certificate {
+			parsed, err := x509.ParseCertificate(der)
+			if err != nil {
+				return fmt.Errorf("server certificate %d: %w", i, err)
+			}
+			if now.Before(parsed.NotBefore) || now.After(parsed.NotAfter) {
+				return fmt.Errorf("server certificate %d is not valid at %s (valid from %s to %s)", i, now.UTC(), parsed.NotBefore.UTC(), parsed.NotAfter.UTC())
 			}
 		}
-		return fmt.Errorf("client certificate URI SANs %v do not include the expected caller identity %q", leaf.URIs, expectedSAN)
+		_, trustCertificates, err := credbundle.ParseTrustBundle(cfg.ClientCAFile)
+		if err != nil {
+			return fmt.Errorf("client trust bundle: %w", err)
+		}
+		for i, certificate := range trustCertificates {
+			if now.Before(certificate.NotBefore) || now.After(certificate.NotAfter) {
+				return fmt.Errorf("client trust certificate %d is not valid at %s (valid from %s to %s)", i, now.UTC(), certificate.NotBefore.UTC(), certificate.NotAfter.UTC())
+			}
+		}
+		return nil
 	}
 }

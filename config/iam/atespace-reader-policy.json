@@ -5,7 +5,7 @@
       "Sid": "ReadOnlyTheSessionAtespacesInjectableSecrets",
       "Effect": "Allow",
       "Action": "secretsmanager:GetSecretValue",
-      "Resource": "arn:aws:secretsmanager:us-west-2:111122223333:secret:ate/${aws:PrincipalTag/ate-atespace}/*",
+      "Resource": "arn:REPLACE_WITH_AWS_PARTITION:secretsmanager:REPLACE_WITH_AWS_REGION:REPLACE_WITH_AWS_ACCOUNT_ID:secret:ate/${aws:PrincipalTag/ate-atespace}/*",
       "Condition": {
         "StringEquals": {"aws:ResourceTag/ate.dev/injectable": "true"}
       }
