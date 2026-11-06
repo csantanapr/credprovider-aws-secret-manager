@@ -12,7 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.4
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.1
 	github.com/aws/smithy-go v1.25.1
-	go.ate.dev/substrate v1.0.0-rc.3
+	go.ate.dev/substrate v1.0.0
 	golang.org/x/net v0.60.0
 	google.golang.org/grpc v1.83.2
 	sigs.k8s.io/yaml v1.6.0

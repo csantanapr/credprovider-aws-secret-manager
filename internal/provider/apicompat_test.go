@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// validCredentialURI is copied from substrate v1.0.0-rc.3
+// validCredentialURI is copied from substrate v1.0.0
 // cmd/ateapi/internal/apivalidation/egress_policy.go, which plugins cannot
 // import, with validation.IsDNS1123Subdomain replaced by an equivalent regexp
 // and length check. It checks that the EgressPolicy API accepts every URI this

@@ -164,7 +164,7 @@ from its logs.
 Prerequisites:
 
 - An EKS cluster with the EKS Pod Identity Agent add-on, running substrate
-  v1.0.0-rc.3 or newer. The provider gets its serving certificate and its
+  v1.0.0 or newer. The provider gets its serving certificate and its
   callers' trust bundle from substrate's pod certificate controller.
 - For the NetworkPolicy to take effect, the Amazon VPC CNI with
   `enableNetworkPolicy: "true"`.
